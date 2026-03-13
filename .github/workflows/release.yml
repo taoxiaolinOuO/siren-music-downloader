@@ -5,6 +5,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: windows-latest
@@ -30,5 +33,7 @@ jobs:
           name: Release v1.0.${{ github.run_number }}
           body: 自动发布的版本
           files: dist/siren-music-downloader.exe
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
