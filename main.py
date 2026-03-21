@@ -377,8 +377,38 @@ class SirenMusicDownloader:
             self.log(f"获取专辑 {album['name']} 详情失败", "error")
             return
         
+        # 先计算总文件数（只基于专辑信息，不获取歌曲详情）
+        # 专辑图片
+        album_file_count = 1 if ("coverUrl" in album_detail and album_detail["coverUrl"]) else 0
+        # 每首歌曲至少有一个文件
+        album_file_count += len(album_detail["songs"])
         # 增加总文件数
-        self.total_files += len(album_detail["songs"])
+        self.total_files += album_file_count
+        
+        # 创建任务列表
+        tasks = []
+        
+        # 提交专辑图片下载任务
+        if "coverUrl" in album_detail and album_detail["coverUrl"]:
+            cover_url = album_detail["coverUrl"]
+            # 从链接中提取文件名
+            original_cover_filename = os.path.basename(cover_url)
+            # 提取文件扩展名
+            ext = os.path.splitext(original_cover_filename)[1]
+            # 为专辑图片添加前缀
+            album_name_prefix = self.sanitize_filename(album["name"])
+            cover_filename = f"album-{album_name_prefix}-{original_cover_filename}"
+            cover_path = os.path.join(album_folder, cover_filename)
+            # 直接执行专辑图片下载
+            if self.download_file(cover_url, cover_path):
+                with new_files_lock:
+                    new_files.append(cover_path)
+                self.downloaded_files += 1
+                self.update_progress()
+        else:
+            # 如果没有专辑图片，也要更新进度
+            self.downloaded_files += 1
+            self.update_progress()
         
         # 为每个歌曲创建任务
         with ThreadPoolExecutor(max_workers=5) as song_executor:
@@ -387,24 +417,8 @@ class SirenMusicDownloader:
                 if not self.downloading:
                     break
                 
-                song_detail = self.get_song_detail(song["cid"])
-                if not song_detail:
-                    self.log(f"获取歌曲 {song['name']} 详情失败", "error")
-                    self.downloaded_files += 1
-                    self.update_progress()
-                    continue
-                
-                # 检查是否已下载
-                album_cid = song_detail.get("albumCid", album["cid"])
-                if album_cid in self.downloaded_files_log:
-                    if song["cid"] in self.downloaded_files_log[album_cid]:
-                        self.log(f"歌曲 {song['name']} 已下载，跳过", "success")
-                        self.downloaded_files += 1
-                        self.update_progress()
-                        continue
-                
-                # 提交歌曲下载任务
-                song_tasks.append(song_executor.submit(self.download_task, song, song_detail, album_folder, album_cid, new_files, new_files_lock))
+                # 提交歌曲处理任务
+                song_tasks.append(song_executor.submit(self.process_song, song, album, album_folder, new_files, new_files_lock))
             
             # 等待所有歌曲任务完成
             for task in song_tasks:
@@ -412,6 +426,31 @@ class SirenMusicDownloader:
                     task.result()
                 except Exception as e:
                     self.log(f"处理歌曲任务失败: {e}", "error")
+    
+    def process_song(self, song, album, album_folder, new_files, new_files_lock):
+        if not self.downloading:
+            return
+        
+        song_detail = self.get_song_detail(song["cid"])
+        if not song_detail:
+            self.log(f"获取歌曲 {song['name']} 详情失败", "error")
+            # 即使失败也要更新进度
+            self.downloaded_files += 1
+            self.update_progress()
+            return
+        
+        # 检查是否已下载
+        album_cid = song_detail.get("albumCid", album["cid"])
+        if album_cid in self.downloaded_files_log:
+            if song["cid"] in self.downloaded_files_log[album_cid]:
+                self.log(f"歌曲 {song['name']} 已下载，跳过", "success")
+                # 跳过的文件也要计入已下载数
+                self.downloaded_files += 1
+                self.update_progress()
+                return
+        
+        # 执行歌曲下载任务
+        self.download_task(song, song_detail, album_folder, album_cid, new_files, new_files_lock)
 
     def sanitize_filename(self, filename):
         # 移除或替换Windows系统不允许的字符
@@ -459,7 +498,19 @@ class SirenMusicDownloader:
                 with new_files_lock:
                     new_files.append(lyric_path)
         
-        # 更新进度
+        # 下载歌曲图片（mvCoverUrl）
+        if "mvCoverUrl" in song_detail and song_detail["mvCoverUrl"]:
+            # 从链接中提取文件名
+            original_cover_filename = os.path.basename(song_detail['mvCoverUrl'])
+            # 为歌曲图片添加前缀
+            song_name_prefix = self.sanitize_filename(song['name'])
+            cover_filename = f"song-{song_name_prefix}-{original_cover_filename}"
+            cover_path = os.path.join(album_folder, cover_filename)
+            if self.download_file(song_detail["mvCoverUrl"], cover_path):
+                with new_files_lock:
+                    new_files.append(cover_path)
+        
+        # 无论歌曲文件是否存在，都更新进度（每首歌曲计为一个文件）
         self.downloaded_files += 1
         self.update_progress()
     
@@ -494,8 +545,16 @@ class SirenMusicDownloader:
                 if content_length:
                     file_size_mb = int(content_length) / (1024 * 1024)
                     self.log(f"文件大小: {file_size_mb:.2f} MB", "info", f"文件名: {os.path.basename(save_path)}")
-                # 下载文件
-                shutil.copyfileobj(response, out_file)
+                # 分块下载，支持停止
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while self.downloading:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                if not self.downloading:
+                    self.log(f"下载已停止: {os.path.basename(save_path)}", "info")
+                    return False
             
             # 下载完成后检查文件大小
             file_size = os.path.getsize(save_path)
