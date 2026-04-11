@@ -1,584 +1,773 @@
 #!/usr/bin/env python3
+"""
+塞壬唱片音乐下载器 - Siren Music Downloader v2.0
+从明日方舟塞壬唱片API高效并行下载专辑封面、歌曲音频、歌词和MV封面
+"""
+
 import os
 import sys
 import json
+import time
 from datetime import datetime
-from tkinter import Tk, Label, Button, Radiobutton, StringVar, DoubleVar, Text, Scrollbar, Frame, ttk
+from tkinter import Tk, Label, Button, DoubleVar, Text, Scrollbar, Frame, ttk, font as tkfont
+import tkinter as tk
 import threading
-import queue
 import requests
-import urllib.request
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import shutil
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 class SirenMusicDownloader:
+
+    API_BASE = "https://monster-siren.hypergryph.com/api"
+    SAVE_DIR = "siren-music"
+    LOG_FILE = "siren-music/download-filelist-logs.json"
+
+    COLORS = {
+        'bg_primary': '#0d1117',
+        'bg_secondary': '#0a0e14',
+        'bg_tertiary': '#131920',
+        'border': '#1e2630',
+        'text_primary': '#c9d1d9',
+        'text_secondary': '#6e7681',
+        'text_muted': '#484f58',
+        'accent_blue': '#58a6ff',
+        'accent_green': '#56d364',
+        'accent_red': '#f85149',
+        'accent_yellow': '#e3b341',
+        'success': '#56d364',
+        'error': '#f85149',
+        'info': '#58a6ff',
+        'warning': '#e3b341',
+    }
+
+    MAX_ALBUM_WORKERS = 8
+    MAX_SONG_WORKERS = 8
+    MAX_API_CONCURRENT = 32
+    MAX_DL_CONCURRENT = 48
+    DOWNLOAD_TIMEOUT = 30
+    API_TIMEOUT = 15
+    MAX_RETRIES = 3
+
+    FONT_FAMILY = "Consolas"
+    MONO_FONT = "Consolas"
+
+    FONT_TITLE = 16
+    FONT_BODY = 12
+    FONT_SMALL = 11
+    FONT_TINY = 9
+    FONT_BTN = 10
+    FONT_LOG = 9
+
+    @staticmethod
+    def _resource_path(*parts):
+        if getattr(sys, 'frozen', False):
+            return os.path.join(sys._MEIPASS, *parts)
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts)
+
     def __init__(self, root):
         self.root = root
-        self.root.title("塞壬唱片下载器 v1.0")
-        self.root.geometry("850x700")
+        self._setup_window()
+        self._init_state()
+        self.session = self._create_session()
+        self._setup_ui()
+        self._log_renderer = self._LogRenderer(self)
+        self._load_download_log()
+        self._is_first_run = not os.path.exists(self.LOG_FILE)
+
+    def _setup_window(self):
+        self.root.title("塞壬唱片下载器 v2.0")
+        self.root.geometry("900x720")
         self.root.resizable(False, False)
-        
-        # 下载选项
-        self.download_option = StringVar(value="full")
-        
-        # 日志队列
-        self.log_queue = queue.Queue()
-        
-        # 下载状态
+        self.root.configure(bg=self.COLORS['bg_primary'])
+
+    def _init_state(self):
         self.downloading = False
-        self.download_thread = None
-        
-        # 进度信息
         self.total_files = 0
         self.downloaded_files = 0
-        
-        # 已下载记录
-        self.downloaded_files_log = {}
-        self.log_file_path = "siren-music/download-filelist-logs.json"
-        
-        # 初始化UI
-        self.setup_ui()
-        
-        # 加载已下载记录
-        self.load_downloaded_log()
-    
-    def setup_ui(self):
-        # 设置夜间主题
-        self.root.configure(bg="#121212")
-        
-        # 顶部标题栏
-        title_frame = Frame(self.root, bg="#1e1e1e", relief="raised", bd=0)
-        title_frame.pack(fill="x", pady=0)
-        # 左侧：应用名称和版本
-        app_info_frame = Frame(title_frame, bg="#1e1e1e")
-        app_info_frame.pack(side="left", padx=20, pady=15)
-        Label(app_info_frame, text="塞壬唱片下载器", font=('微软雅黑', 18, 'bold'), fg="#3498db", bg="#1e1e1e").pack(side="left")
-        Label(app_info_frame, text="v1.0", font=('微软雅黑', 12), fg="#777777", bg="#1e1e1e").pack(side="left", padx=10)
-        # 右侧：作者信息
-        author_info_frame = Frame(title_frame, bg="#1e1e1e")
-        author_info_frame.pack(side="right", padx=20, pady=15)
-        Label(author_info_frame, text="作者：Aco | 方舟&终末地ID：我永远喜欢42", 
-              font=('微软雅黑', 11), fg="#999999", bg="#1e1e1e").pack(side="right")
-        
-        # 上部：用户操作区（缩小高度）
-        top_frame = Frame(self.root, bg="#121212")
-        top_frame.pack(fill="x", padx=20, pady=15)
-        
-        # 卡片式容器
-        operation_card = Frame(top_frame, bg="#1e1e1e", relief="raised", bd=0, padx=30, pady=20)
-        operation_card.pack(fill="x", expand=True, padx=0, pady=0)
-        operation_card.config(highlightbackground="#333333", highlightthickness=1)
-        
-        # 下载选项
-        option_frame = Frame(operation_card, bg="#1e1e1e")
-        option_frame.pack(side="left", fill="y", expand=True)
-        Label(option_frame, text="下载选项：", font=('微软雅黑', 12, 'bold'), fg="#e0e0e0", bg="#1e1e1e").pack(side="left", padx=5, pady=0, anchor="center")
-        
-        # 下载选项容器
-        radio_frame = Frame(option_frame, bg="#1e1e1e")
-        radio_frame.pack(side="left", fill="y", expand=True)
-        
-        # 自定义Radiobutton样式
+        self.downloaded_log = {}
+        self.album_order = []
+        self._log_line_width = 100
+        self._ui_lock = threading.Lock()
+        self._api_semaphore = threading.Semaphore(self.MAX_API_CONCURRENT)
+        self._dl_semaphore = threading.Semaphore(self.MAX_DL_CONCURRENT)
+        self._log_renderer = None
+        self._stop_event = threading.Event()
+        self._executors = []
+
+    def _create_session(self):
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=self.MAX_RETRIES,
+            backoff_factor=1.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=20)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://monster-siren.hypergryph.com/"
+        })
+        return session
+
+    def _create_btn(self, parent, text, color, command):
+        btn_frame = Frame(parent, bg=color, cursor="hand2", padx=24, pady=8)
+        text_lbl = Label(btn_frame, text=text, font=(self.FONT_FAMILY, self.FONT_BTN, 'bold'),
+                         fg="white", bg=color, anchor="center")
+        text_lbl.pack(side="left")
+
+        def on_click(e):
+            command()
+
+        for w in [btn_frame, text_lbl]:
+            w.bind("<Button-1>", on_click)
+
+        btn_frame.pack(side="left", padx=8)
+        return btn_frame
+
+    def _setup_ui(self):
+        self._build_header()
+        self._build_control_panel()
+        self._build_log_panel()
+        self._build_progress_bar()
+        self.root.after(200, self._calc_line_width)
+
+    def _calc_line_width(self):
+        try:
+            tw = self.log_text.winfo_width()
+            if tw > 1:
+                cw = tkfont.Font(font=(self.MONO_FONT, self.FONT_LOG)).measure('0')
+                if cw > 0:
+                    self._log_line_width = max(60, (tw - 20) // cw)
+        except Exception:
+            pass
+
+    def _build_header(self):
+        header = Frame(self.root, bg=self.COLORS['bg_secondary'], height=60)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        left = Frame(header, bg=self.COLORS['bg_secondary'])
+        left.pack(side="left", padx=24, pady=14)
+        Label(left, text="塞壬唱片下载器", font=(self.FONT_FAMILY, self.FONT_TITLE),
+              fg=self.COLORS['accent_blue'], bg=self.COLORS['bg_secondary']).pack(side="left")
+        Label(left, text=" v2.0", font=(self.FONT_FAMILY, self.FONT_SMALL),
+              fg=self.COLORS['text_secondary'], bg=self.COLORS['bg_secondary'],
+              anchor="center").pack(side="left")
+
+        right = Frame(header, bg=self.COLORS['bg_secondary'])
+        right.pack(side="right", padx=24, pady=14)
+        Label(right, text="Author: Aco  |  方舟ID: 我永远喜欢42#1710",
+              font=(self.FONT_FAMILY, self.FONT_TINY), fg=self.COLORS['text_secondary'],
+              bg=self.COLORS['bg_secondary'], anchor="center").pack(side="right")
+
+    def _build_control_panel(self):
+        panel = Frame(self.root, bg=self.COLORS['bg_primary'])
+        panel.pack(fill="x", padx=20, pady=(12, 8))
+
+        card = Frame(panel, bg=self.COLORS['bg_secondary'],
+                     highlightbackground=self.COLORS['border'], highlightthickness=1)
+        card.pack(fill="x", ipadx=28, ipady=16)
+
+        Label(card, text="[i] 【全量下载模式】- 请确保exe当前所在目录的存储空间足够！",
+              font=(self.FONT_FAMILY, self.FONT_SMALL), fg=self.COLORS['text_secondary'],
+              bg=self.COLORS['bg_secondary']).pack(side="left", padx=18)
+
+        btn_box = Frame(card, bg=self.COLORS['bg_secondary'])
+        btn_box.pack(side="right", padx=18)
+
+        self.stop_btn = self._create_btn(btn_box, "停止下载",
+                                          self.COLORS['accent_red'], self.stop_download)
+        self.start_btn = self._create_btn(btn_box, "开始下载",
+                                           self.COLORS['accent_green'], self.start_download)
+
+    def _build_log_panel(self):
+        wrap = Frame(self.root, bg=self.COLORS['bg_primary'])
+        wrap.pack(fill="both", expand=True, padx=20, pady=8)
+
+        title_bar = Frame(wrap, bg=self.COLORS['bg_primary'])
+        title_bar.pack(fill="x", pady=(0, 6))
+        Label(title_bar, text=">> 下载日志", font=(self.FONT_FAMILY, self.FONT_BODY),
+              fg=self.COLORS['accent_blue'], bg=self.COLORS['bg_primary']).pack(side="left")
+
+        log_frame = Frame(wrap, bg=self.COLORS['bg_secondary'],
+                          highlightbackground=self.COLORS['border'], highlightthickness=1)
+        log_frame.pack(fill="both", expand=True)
+
+        self.log_text = Text(log_frame, wrap="char",
+                             bg=self.COLORS['bg_primary'], fg=self.COLORS['text_primary'],
+                             font=(self.MONO_FONT, self.FONT_LOG), relief="flat", bd=0,
+                             insertbackground=self.COLORS['text_secondary'], padx=10, pady=10)
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+        for tag, fg in [("error", self.COLORS['error']), ("warning", self.COLORS['warning']),
+                        ("info", self.COLORS['info']), ("success", self.COLORS['success'])]:
+            self.log_text.tag_configure(tag, foreground=fg, font=(self.MONO_FONT, self.FONT_LOG, 'bold'))
+
+        sb = Scrollbar(log_frame, command=self.log_text.yview,
+                       bg=self.COLORS['bg_tertiary'], troughcolor=self.COLORS['bg_secondary'])
+        sb.pack(side="right", fill="y")
+        self.log_text.config(yscrollcommand=sb.set)
+
+    def _build_progress_bar(self):
+        bottom = Frame(self.root, bg=self.COLORS['bg_primary'])
+        bottom.pack(fill="x", padx=20, pady=(8, 16))
+
+        bar_frame = Frame(bottom, bg=self.COLORS['bg_primary'])
+        bar_frame.pack(fill="x", pady=(4, 0))
+
+        Label(bar_frame, text="进度", font=(self.FONT_FAMILY, self.FONT_SMALL, 'bold'),
+              fg=self.COLORS['text_muted'], bg=self.COLORS['bg_primary']).pack(side="left")
+        self.progress_label = Label(bar_frame, text="0%", font=(self.MONO_FONT, self.FONT_BTN, 'bold'),
+                                    fg=self.COLORS['accent_blue'], bg=self.COLORS['bg_primary'],
+                                    width=6, anchor="center")
+        self.progress_label.pack(side="right")
+
         style = ttk.Style()
-        style.configure("TRadiobutton", background="#1e1e1e", foreground="#e0e0e0", font=('微软雅黑', 10))
-        
-        Radiobutton(radio_frame, text="测试下载(前3个)", variable=self.download_option, value="test3", 
-                   font=('微软雅黑', 10), fg="#e0e0e0", bg="#1e1e1e", selectcolor="#34495e").pack(side="left", padx=10, pady=0, anchor="center")
-        Radiobutton(radio_frame, text="测试下载(前6个)", variable=self.download_option, value="test6", 
-                   font=('微软雅黑', 10), fg="#e0e0e0", bg="#1e1e1e", selectcolor="#34495e").pack(side="left", padx=10, pady=0, anchor="center")
-        Radiobutton(radio_frame, text="全量下载", variable=self.download_option, value="full", 
-                   font=('微软雅黑', 10), fg="#e0e0e0", bg="#1e1e1e", selectcolor="#34495e").pack(side="left", padx=10, pady=0, anchor="center")
-        
-        # 按钮
-        button_frame = Frame(operation_card, bg="#1e1e1e")
-        button_frame.pack(side="right", padx=0)
-        
-        # 结束下载按钮
-        stop_button = Button(button_frame, text="结束下载", command=self.stop_download, 
-               font=('微软雅黑', 11, 'bold'), bg="#e74c3c", fg="#ffffff", 
-               padx=25, pady=10, relief="flat", activebackground="#c0392b", 
-               activeforeground="#ffffff", cursor="hand2", bd=0, highlightthickness=0)
-        # 添加按钮悬停效果
-        def on_enter_stop(e):
-            stop_button.config(bg="#c0392b")
-        def on_leave_stop(e):
-            stop_button.config(bg="#e74c3c")
-        stop_button.bind("<Enter>", on_enter_stop)
-        stop_button.bind("<Leave>", on_leave_stop)
-        stop_button.pack(side="left", padx=8, pady=0)
-        
-        # 开始下载按钮
-        start_button = Button(button_frame, text="开始下载", command=self.start_download, 
-               font=('微软雅黑', 11, 'bold'), bg="#3498db", fg="#ffffff", 
-               padx=25, pady=10, relief="flat", activebackground="#2980b9", 
-               activeforeground="#ffffff", cursor="hand2", bd=0, highlightthickness=0)
-        # 添加按钮悬停效果
-        def on_enter_start(e):
-            start_button.config(bg="#2980b9")
-        def on_leave_start(e):
-            start_button.config(bg="#3498db")
-        start_button.bind("<Enter>", on_enter_start)
-        start_button.bind("<Leave>", on_leave_start)
-        start_button.pack(side="left", padx=8, pady=0)
-        
-        # 中部：日志输出区域（增大空间）
-        middle_frame = Frame(self.root, bg="#121212")
-        middle_frame.pack(fill="both", expand=True, padx=20, pady=10)
-        
-        # 日志标题
-        log_title_frame = Frame(middle_frame, bg="#121212")
-        log_title_frame.pack(fill="x", pady=5)
-        Label(log_title_frame, text="下载日志", font=('微软雅黑', 12, 'bold'), fg="#3498db", bg="#121212").pack(side="left")
-        
-        # 日志文本框
-        log_text_frame = Frame(middle_frame, bg="#1e1e1e", relief="sunken", bd=0)
-        log_text_frame.pack(fill="both", expand=True)
-        log_text_frame.config(highlightbackground="#333333", highlightthickness=1)
-        
-        self.log_text = Text(log_text_frame, wrap="word", bg="#1e1e1e", fg="#e0e0e0", 
-                            font=('Consolas', 10), relief="flat", bd=0)
-        self.log_text.pack(side="left", fill="both", expand=True, padx=1, pady=1)
-        
-        # 配置日志颜色
-        self.log_text.tag_configure("error", foreground="#e74c3c")  # 红色 - 错误信息
-        self.log_text.tag_configure("warning", foreground="#f39c12")  # 橙色 - 警告信息
-        self.log_text.tag_configure("info", foreground="#3498db")  # 蓝色 - 普通信息
-        self.log_text.tag_configure("success", foreground="#27ae60")  # 绿色 - 成功信息
-        
-        scrollbar = Scrollbar(log_text_frame, command=self.log_text.yview, 
-                            bg="#333333", relief="flat", bd=0)
-        scrollbar.pack(side="right", fill="y", padx=1, pady=1)
-        self.log_text.config(yscrollcommand=scrollbar.set)
-        
-        # 底部：进度条（提高位置）
-        bottom_frame = Frame(self.root, bg="#121212")
-        bottom_frame.pack(fill="x", padx=20, pady=10)
-        
-        # 进度条标题和百分比
-        progress_title_frame = Frame(bottom_frame, bg="#121212")
-        progress_title_frame.pack(fill="x", pady=5)
-        progress_title = Label(progress_title_frame, text="下载进度", font=('微软雅黑', 12, 'bold'), fg="#3498db", bg="#121212")
-        progress_title.pack(side="left")
-        self.progress_label = Label(progress_title_frame, text="0%", font=('微软雅黑', 11, 'bold'), 
-                                  fg="#3498db", bg="#121212", width=8)
-        self.progress_label.pack(side="right", padx=0)
-        
-        # 进度条
-        progress_bar_frame = Frame(bottom_frame, bg="#121212")
-        progress_bar_frame.pack(fill="x")
-        
-        self.progress_var = DoubleVar()
-        # 自定义进度条样式
-        style = ttk.Style()
-        style.configure("TProgressbar", 
-                       background="#3498db", 
-                       troughcolor="#2a2a2a", 
-                       thickness=14, 
-                       bordercolor="#333333", 
-                       lightcolor="#4aa3df", 
-                       darkcolor="#2980b9")
-        # 创建新的进度条样式
-        style.layout("TProgressbar", [
-            ('TProgressbar.trough', {'sticky': 'nswe', 'children': [
-                ('TProgressbar.pbar', {'sticky': 'nswe'})
+        style.theme_use('default')
+        style.layout("Custom.Horizontal.TProgressbar", [
+            ('Horizontal.TProgressbar.trough', {'sticky': 'nswe', 'children': [
+                ('Horizontal.TProgressbar.pbar', {'sticky': 'nswe'})
             ]})
         ])
-        self.progress_bar = ttk.Progressbar(progress_bar_frame, variable=self.progress_var, maximum=100, 
-                                          length=100, mode="determinate", style="TProgressbar")
-        self.progress_bar.pack(fill="x", expand=True, side="left", padx=0)
-        
+        style.configure("Custom.Horizontal.TProgressbar",
+                        background=self.COLORS['accent_green'],
+                        troughcolor=self.COLORS['bg_tertiary'], thickness=10, borderwidth=0)
 
-    
-    def load_downloaded_log(self):
-        if os.path.exists(self.log_file_path):
-            try:
-                with open(self.log_file_path, "r", encoding="utf-8") as f:
-                    self.downloaded_files_log = json.load(f)
-                self.log("成功加载已下载记录", "success")
-            except Exception as e:
-                self.log(f"加载已下载记录失败: {e}", "error")
-    
-    def save_downloaded_log(self):
-        try:
-            os.makedirs(os.path.dirname(self.log_file_path), exist_ok=True)
-            with open(self.log_file_path, "w", encoding="utf-8") as f:
-                json.dump(self.downloaded_files_log, f, ensure_ascii=False, indent=2)
-            self.log("成功保存已下载记录", "success")
-        except Exception as e:
-            self.log(f"保存已下载记录失败: {e}", "error")
-    
+        pframe = Frame(bottom, bg=self.COLORS['bg_primary'])
+        pframe.pack(fill="x", pady=(8, 0))
+        self.progress_var = DoubleVar()
+        self.progress_bar = ttk.Progressbar(pframe, variable=self.progress_var, maximum=100,
+                                            mode="determinate", style="Custom.Horizontal.TProgressbar")
+        self.progress_bar.pack(fill="x")
+
     def log(self, message, level="info", details=""):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        log_message = f"[{timestamp}] [{level.upper()}] {message}"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        line = f"[{ts}] [{level.upper()}] {message}"
         if details:
-            log_message += f" - {details}"
-        
-        # 不同颜色区分日志级别
-        if level == "error":
-            self.log_text.insert("end", log_message + "\n", "error")
-        elif level == "warning":
-            self.log_text.insert("end", log_message + "\n", "warning")
-        elif level == "success":
-            self.log_text.insert("end", log_message + "\n", "success")
+            line += f" {details}"
+        if self._log_renderer:
+            self._log_renderer.add_global(line, level)
         else:
-            self.log_text.insert("end", log_message + "\n", "info")
-        
-        self.log_text.see("end")
-    
+            with self._ui_lock:
+                self.log_text.insert("end", line + "\n", level)
+                self.log_text.see("end")
+
+    def _insert_text(self, txt, text, tag):
+        txt.insert("end", text + "\n", tag)
+
+    @staticmethod
+    def _display_width(text):
+        return sum(2 if ord(c) > 0x4E00 else 1 for c in text)
+
+    def _make_sep(self, used_width=0):
+        return "-" * max(4, self._log_line_width - used_width)
+
+    def _log_wrap(self, prefix, content_list, level="success", sep="、"):
+        if content_list:
+            self.log(prefix + sep.join(f"[{item}]" for item in content_list), level)
+
+    _zone_order_lock = threading.Lock()
+
+    class _LogRenderer:
+
+        def __init__(self, owner):
+            self.owner = owner
+            self.zones = []
+            self._global_lines = []
+            self._refresh_job = None
+            self._running = False
+
+        def add_global(self, line, tag):
+            with SirenMusicDownloader._zone_order_lock:
+                self._global_lines.append((line, tag))
+
+        def register(self, zone):
+            with SirenMusicDownloader._zone_order_lock:
+                if zone not in self.zones:
+                    self.zones.append(zone)
+
+        def start_periodic(self):
+            self._running = True
+            self._do_refresh()
+            self._refresh_job = self.owner.root.after(80, self.start_periodic)
+
+        def stop_periodic(self):
+            self._running = False
+            if self._refresh_job:
+                try:
+                    self.owner.root.after_cancel(self._refresh_job)
+                except Exception:
+                    pass
+                self._refresh_job = None
+
+        def force_refresh(self):
+            self._do_refresh()
+
+        def _do_refresh(self):
+            txt = self.owner.log_text
+            lock = self.owner._ui_lock
+            owner = self.owner
+            with lock:
+                try:
+                    txt.delete("1.0", "end")
+                except Exception:
+                    pass
+                try:
+                    for line, tag in self._global_lines:
+                        owner._insert_text(txt, line, tag)
+                    for z in self.zones:
+                        z._render_lines(txt, owner)
+                    txt.see("end")
+                except Exception:
+                    pass
+
+    class _AlbumZone:
+
+        def __init__(self, owner, album_name):
+            self.owner = owner
+            self.album_name = album_name
+            self.status = "正在下载"
+            self.items = []
+            self._started = False
+
+        def start(self, status="正在下载"):
+            if self._started:
+                return
+            self._started = True
+            self.status = status
+            self.owner._log_renderer.register(self)
+
+        def downloading(self, msg):
+            if not self._started:
+                return -1
+            idx = len(self.items)
+            self.items.append({"type": "downloading", "msg": msg,
+                               "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]})
+            return idx
+
+        def success(self, idx, fname, size_mb):
+            if not self._started or idx < 0 or idx >= len(self.items):
+                return
+            self.items[idx] = {"type": "success", "msg": f"{fname} ({size_mb:.2f}MB)",
+                               "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}
+
+        def skip_file(self, fname):
+            if not self._started:
+                return
+            self.items.append({"type": "skip", "msg": fname,
+                               "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]})
+
+        def error(self, msg):
+            if isinstance(msg, tuple):
+                idx, err_msg = msg
+                if not self._started or idx < 0 or idx >= len(self.items):
+                    return
+                self.items[idx] = {"type": "error", "msg": err_msg,
+                                   "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}
+            else:
+                if not self._started:
+                    return
+                self.items.append({"type": "error", "msg": str(msg),
+                                   "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]})
+
+        def complete(self, status="下载完成"):
+            if not self._started:
+                return
+            self.status = status
+
+        def _render_lines(self, txt, owner):
+            is_done = self.status in ("下载完成", "已跳过", "获取失败")
+            level_tag = "success" if is_done else "info"
+            prefix = "[{ts}] [SUCCESS] " if is_done else "[{ts}] [INFO] "
+            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            title_prefix = prefix.format(ts=now_ts)
+            title_content = f"[{self.album_name}] {self.status} "
+            used = owner._display_width(title_prefix + title_content)
+            title_line = title_prefix + title_content + owner._make_sep(used)
+            owner._insert_text(txt, title_line, level_tag)
+            tag_map = {"downloading": ("info", "正在下载"), "success": ("success", "下载完成"),
+                        "error": ("error", ""), "skip": ("success", "文件已存在，跳过")}
+            for item in self.items:
+                itype = item["type"]
+                tag, label = tag_map.get(itype, ("info", ""))
+                line_ts = item.get("ts", now_ts)
+                line = f"[{line_ts}] [{tag.upper()}] {label} {item['msg']}"
+                owner._insert_text(txt, line, tag)
+            if is_done:
+                txt.insert("end", owner._make_sep() + "\n", "success")
+
+    def _load_download_log(self):
+        if os.path.exists(self.LOG_FILE):
+            try:
+                with open(self.LOG_FILE, "r", encoding="utf-8") as f:
+                    self.downloaded_log = json.load(f)
+                self._migrate_legacy_format()
+                self.log("[OK] 已加载下载记录，共 {} 个专辑".format(len(self.downloaded_log)), "success")
+            except Exception as e:
+                self.log(f"加载记录失败: {e}", "error")
+                self.downloaded_log = {}
+
+    def _migrate_legacy_format(self):
+        changed = False
+        for cid, data in self.downloaded_log.items():
+            if not isinstance(data, dict) or "songs" in data:
+                continue
+            songs = {k: v for k, v in data.items() if k not in ("albumName",)}
+            self.downloaded_log[cid] = {"albumName": data.get("albumName", ""), "songs": songs}
+            changed = True
+        if changed:
+            self.log("[~~] 检测到旧格式记录，已完成自动迁移", "info")
+
+    def _save_download_log(self):
+        try:
+            os.makedirs(os.path.dirname(self.LOG_FILE), exist_ok=True)
+            ordered = {cid: self.downloaded_log[cid] for cid in self.album_order if cid in self.downloaded_log}
+            ordered.update({cid: d for cid, d in self.downloaded_log.items() if cid not in ordered})
+            with open(self.LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(ordered, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"保存记录失败: {e}", "error")
+
     def start_download(self):
         if self.downloading:
-            self.log("下载已在进行中", "warning")
+            self.log("下载进行中，请勿重复操作", "warning")
             return
-        
         self.downloading = True
+        self._stop_event.clear()
+        self._executors = []
         self.total_files = 0
         self.downloaded_files = 0
         self.progress_var.set(0)
         self.progress_label.config(text="0%")
-        
-        # 清空最近更新文件夹
-        recent_folder = "siren-music/0-最近更新"
-        if os.path.exists(recent_folder):
-            try:
-                shutil.rmtree(recent_folder)
-                self.log("清空最近更新文件夹", "success")
-            except Exception as e:
-                self.log(f"清空最近更新文件夹失败: {e}", "error")
-        
-        # 启动下载线程
-        self.download_thread = threading.Thread(target=self.download_process)
-        self.download_thread.daemon = True
-        self.download_thread.start()
-    
-    def stop_download(self):
-        self.downloading = False
-        if self.download_thread:
-            self.log("正在停止下载...", "info")
-    
-    def download_process(self):
-        try:
-            # 获取所有专辑
-            albums = self.get_albums()
-            if not albums:
-                self.log("获取专辑列表失败", "error")
-                self.downloading = False
-                return
-            
-            # 根据下载选项过滤专辑
-            option = self.download_option.get()
-            if option == "test3":
-                albums = albums[:3]
-            elif option == "test6":
-                albums = albums[:6]
-            
-            # 开始下载
-            import threading
-            new_files_lock = threading.Lock()
-            new_files = []
-            
-            # 并行下载
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                # 遍历专辑并提交任务
-                for album in albums:
-                    if not self.downloading:
-                        break
-                    
-                    # 提交专辑处理任务
-                    executor.submit(self.process_album, album, new_files, new_files_lock)
-            
-            # 复制新文件到最近更新文件夹
-            if new_files and os.path.exists(self.log_file_path):
-                recent_folder = "siren-music/0-最近更新"
-                os.makedirs(recent_folder, exist_ok=True)
-                for file_path in new_files:
-                    try:
-                        # 提取专辑名称（从文件路径中获取）
-                        album_name = os.path.basename(os.path.dirname(file_path))
-                        # 在最近更新文件夹中创建专辑子文件夹
-                        album_subfolder = os.path.join(recent_folder, album_name)
-                        os.makedirs(album_subfolder, exist_ok=True)
-                        # 复制文件到对应专辑子文件夹
-                        shutil.copy2(file_path, album_subfolder)
-                    except Exception as e:
-                        self.log(f"复制文件到最近更新失败: {e}", "error")
-                self.log(f"已复制 {len(new_files)} 个新文件到最近更新文件夹", "success")
-            
-            # 保存下载记录
-            self.save_downloaded_log()
-            
-            self.log("下载完成", "success")
-        except Exception as e:
-            self.log(f"下载过程出错: {e}", "error")
-        finally:
-            self.downloading = False
-    
-    def update_progress(self):
-        if self.total_files > 0:
-            progress = (self.downloaded_files / self.total_files) * 100
-            self.progress_var.set(progress)
-            self.progress_label.config(text=f"{progress:.1f}%")
-    
-    def get_albums(self):
-        try:
-            response = requests.get("https://monster-siren.hypergryph.com/api/albums")
-            response.raise_for_status()
-            data = response.json()
-            if data.get("code") == 0 and "data" in data:
-                self.log(f"成功获取 {len(data['data'])} 个专辑", "success", f"API响应状态: {data.get('code')}")
-                return data["data"]
-            else:
-                self.log("获取专辑列表失败: 接口返回错误", "error", f"API响应: {data}")
-                return []
-        except Exception as e:
-            self.log(f"获取专辑列表失败", "error", f"错误信息: {str(e)}")
-            return []
-    
-    def get_album_detail(self, album_cid):
-        try:
-            response = requests.get(f"https://monster-siren.hypergryph.com/api/album/{album_cid}/detail")
-            response.raise_for_status()
-            data = response.json()
-            if data.get("code") == 0 and "data" in data:
-                self.log(f"成功获取专辑 {album_cid} 详情", "success", f"专辑名称: {data['data'].get('name')}")
-                return data["data"]
-            else:
-                self.log(f"获取专辑 {album_cid} 详情失败: 接口返回错误", "error", f"API响应: {data}")
-                return None
-        except Exception as e:
-            self.log(f"获取专辑 {album_cid} 详情失败", "error", f"错误信息: {str(e)}")
-            return None
-    
-    def get_song_detail(self, song_cid):
-        try:
-            response = requests.get(f"https://monster-siren.hypergryph.com/api/song/{song_cid}")
-            response.raise_for_status()
-            data = response.json()
-            if data.get("code") == 0 and "data" in data:
-                self.log(f"成功获取歌曲 {song_cid} 详情", "success", f"歌曲名称: {data['data'].get('name')}")
-                return data["data"]
-            else:
-                self.log(f"获取歌曲 {song_cid} 详情失败: 接口返回错误", "error", f"API响应: {data}")
-                return None
-        except Exception as e:
-            self.log(f"获取歌曲 {song_cid} 详情失败", "error", f"错误信息: {str(e)}")
-            return None
-    
-    def process_album(self, album, new_files, new_files_lock):
-        if not self.downloading:
-            return
-        
-        # 清理专辑名称，移除无效字符
-        sanitized_album_name = self.sanitize_filename(album["name"])
-        album_folder = os.path.join("siren-music", sanitized_album_name)
-        os.makedirs(album_folder, exist_ok=True)
-        
-        album_detail = self.get_album_detail(album["cid"])
-        if not album_detail or "songs" not in album_detail:
-            self.log(f"获取专辑 {album['name']} 详情失败", "error")
-            return
-        
-        # 先计算总文件数（只基于专辑信息，不获取歌曲详情）
-        # 专辑图片
-        album_file_count = 1 if ("coverUrl" in album_detail and album_detail["coverUrl"]) else 0
-        # 每首歌曲至少有一个文件
-        album_file_count += len(album_detail["songs"])
-        # 增加总文件数
-        self.total_files += album_file_count
-        
-        # 创建任务列表
-        tasks = []
-        
-        # 提交专辑图片下载任务
-        if "coverUrl" in album_detail and album_detail["coverUrl"]:
-            cover_url = album_detail["coverUrl"]
-            # 从链接中提取文件名
-            original_cover_filename = os.path.basename(cover_url)
-            # 提取文件扩展名
-            ext = os.path.splitext(original_cover_filename)[1]
-            # 为专辑图片添加前缀
-            album_name_prefix = self.sanitize_filename(album["name"])
-            cover_filename = f"album-{album_name_prefix}-{original_cover_filename}"
-            cover_path = os.path.join(album_folder, cover_filename)
-            # 直接执行专辑图片下载
-            if self.download_file(cover_url, cover_path):
-                with new_files_lock:
-                    new_files.append(cover_path)
-                self.downloaded_files += 1
-                self.update_progress()
-        else:
-            # 如果没有专辑图片，也要更新进度
-            self.downloaded_files += 1
-            self.update_progress()
-        
-        # 为每个歌曲创建任务
-        with ThreadPoolExecutor(max_workers=5) as song_executor:
-            song_tasks = []
-            for song in album_detail["songs"]:
-                if not self.downloading:
-                    break
-                
-                # 提交歌曲处理任务
-                song_tasks.append(song_executor.submit(self.process_song, song, album, album_folder, new_files, new_files_lock))
-            
-            # 等待所有歌曲任务完成
-            for task in song_tasks:
-                try:
-                    task.result()
-                except Exception as e:
-                    self.log(f"处理歌曲任务失败: {e}", "error")
-    
-    def process_song(self, song, album, album_folder, new_files, new_files_lock):
-        if not self.downloading:
-            return
-        
-        song_detail = self.get_song_detail(song["cid"])
-        if not song_detail:
-            self.log(f"获取歌曲 {song['name']} 详情失败", "error")
-            # 即使失败也要更新进度
-            self.downloaded_files += 1
-            self.update_progress()
-            return
-        
-        # 检查是否已下载
-        album_cid = song_detail.get("albumCid", album["cid"])
-        if album_cid in self.downloaded_files_log:
-            if song["cid"] in self.downloaded_files_log[album_cid]:
-                self.log(f"歌曲 {song['name']} 已下载，跳过", "success")
-                # 跳过的文件也要计入已下载数
-                self.downloaded_files += 1
-                self.update_progress()
-                return
-        
-        # 执行歌曲下载任务
-        self.download_task(song, song_detail, album_folder, album_cid, new_files, new_files_lock)
+        self.log("=" * 81, "info")
+        self.log("[>>] 开始下载，正在获取专辑列表...", "info")
+        if not self._is_first_run:
+            recent_dir = os.path.join(self.SAVE_DIR, "0-最近更新")
+            if os.path.exists(recent_dir):
+                shutil.rmtree(recent_dir)
+        self._log_renderer.force_refresh()
+        threading.Thread(target=self._download_worker, daemon=True, name="DownloadWorker").start()
 
-    def sanitize_filename(self, filename):
-        # 移除或替换Windows系统不允许的字符
-        invalid_chars = '\\/:*?"<>|'
-        for char in invalid_chars:
-            filename = filename.replace(char, '-')
-        # 处理连续的点号
-        while '..' in filename:
-            filename = filename.replace('..', '.')
-        # 确保文件名不以点号结尾
-        while filename.endswith('.'):
-            filename = filename[:-1]
-        # 去除首尾空格
-        filename = filename.strip()
-        # 确保文件名不为空
-        if not filename:
-            filename = 'unknown'
-        return filename
-    
-    def download_task(self, song, song_detail, album_folder, album_cid, new_files, new_files_lock):
+    def stop_download(self):
         if not self.downloading:
             return
-        
-        # 下载歌曲
-        if "sourceUrl" in song_detail:
-            # 清理文件名，移除无效字符
-            sanitized_song_name = self.sanitize_filename(song['name'])
-            # 获取文件扩展名，确保支持不同类型的音乐文件
-            ext = os.path.splitext(song_detail['sourceUrl'])[1]
-            song_path = os.path.join(album_folder, f"{sanitized_song_name}{ext}")
-            if self.download_file(song_detail["sourceUrl"], song_path):
-                with new_files_lock:
-                    new_files.append(song_path)
-                # 记录已下载
-                if album_cid not in self.downloaded_files_log:
-                    self.downloaded_files_log[album_cid] = {}
-                self.downloaded_files_log[album_cid][song["cid"]] = song["name"]
-        
-        # 下载歌词
-        if "lyricUrl" in song_detail and song_detail["lyricUrl"]:
-            # 清理歌词文件名，移除无效字符
-            sanitized_song_name = self.sanitize_filename(song['name'])
-            lyric_path = os.path.join(album_folder, f"{sanitized_song_name}.lrc")
-            if self.download_file(song_detail["lyricUrl"], lyric_path):
-                with new_files_lock:
-                    new_files.append(lyric_path)
-        
-        # 下载歌曲图片（mvCoverUrl）
-        if "mvCoverUrl" in song_detail and song_detail["mvCoverUrl"]:
-            # 从链接中提取文件名
-            original_cover_filename = os.path.basename(song_detail['mvCoverUrl'])
-            # 为歌曲图片添加前缀
-            song_name_prefix = self.sanitize_filename(song['name'])
-            cover_filename = f"song-{song_name_prefix}-{original_cover_filename}"
-            cover_path = os.path.join(album_folder, cover_filename)
-            if self.download_file(song_detail["mvCoverUrl"], cover_path):
-                with new_files_lock:
-                    new_files.append(cover_path)
-        
-        # 无论歌曲文件是否存在，都更新进度（每首歌曲计为一个文件）
-        self.downloaded_files += 1
-        self.update_progress()
-    
-    def download_file(self, url, save_path):
+        self.downloading = False
+        self._stop_event.set()
+        self.log("[!!] 正在停止下载...", "info")
+        self._log_renderer.stop_periodic()
+        for exc in self._executors:
+            try:
+                exc.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        self._executors.clear()
+        self._log_renderer.force_refresh()
+
+    def _download_worker(self):
+        self.root.after(0, self._log_renderer.start_periodic)
         try:
-            # 确保目录存在
-            directory = os.path.dirname(save_path)
-            if not os.path.exists(directory):
-                os.makedirs(directory, exist_ok=True)
-                self.log(f"创建目录: {directory}", "info")
-            
-            # 检查文件是否已存在
-            if os.path.exists(save_path):
-                self.log(f"文件 {os.path.basename(save_path)} 已存在，跳过", "success", f"路径: {save_path}")
-                return True
-            
-            # 断点续传
-            headers = {}
-            if os.path.exists(save_path):
-                file_size = os.path.getsize(save_path)
-                file_size_mb = file_size / (1024 * 1024)
-                headers["Range"] = f"bytes={file_size}-"
-                self.log(f"继续下载: {os.path.basename(save_path)}", "info", f"已下载: {file_size_mb:.2f} MB")
-            else:
-                self.log(f"开始下载: {os.path.basename(save_path)}", "info", f"URL: {url}")
-            
-            # 使用urllib.request下载
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req) as response, open(save_path, "ab") as out_file:
-                # 获取文件大小
-                content_length = response.headers.get('Content-Length')
-                if content_length:
-                    file_size_mb = int(content_length) / (1024 * 1024)
-                    self.log(f"文件大小: {file_size_mb:.2f} MB", "info", f"文件名: {os.path.basename(save_path)}")
-                # 分块下载，支持停止
-                chunk_size = 1024 * 1024  # 1MB chunks
-                while self.downloading:
-                    chunk = response.read(chunk_size)
-                    if not chunk:
+            albums = self._fetch_albums()
+            if not albums or self._stop_event.is_set():
+                return
+            self.album_order = [str(a["cid"]) for a in albums]
+            new_files = []
+            lock = threading.Lock()
+            self.log("[**] 开始处理 {} 个专辑...".format(len(albums)), "info")
+            outer_exc = ThreadPoolExecutor(max_workers=self.MAX_ALBUM_WORKERS)
+            self._executors.append(outer_exc)
+            try:
+                futures = {outer_exc.submit(self._process_album, album, new_files, lock): album for album in albums}
+                for future in as_completed(futures):
+                    if self._stop_event.is_set():
                         break
-                    out_file.write(chunk)
-                if not self.downloading:
-                    self.log(f"下载已停止: {os.path.basename(save_path)}", "info")
-                    return False
-            
-            # 下载完成后检查文件大小
-            file_size = os.path.getsize(save_path)
-            file_size_mb = file_size / (1024 * 1024)
-            self.log(f"下载完成: {os.path.basename(save_path)}", "success", f"保存路径: {save_path}, 文件大小: {file_size_mb:.2f} MB")
+                    try:
+                        future.result(timeout=0.1)
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    outer_exc.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                if outer_exc in self._executors:
+                    self._executors.remove(outer_exc)
+            new_album_names = [z.album_name for z in self._log_renderer.zones if z.status == "下载完成"]
+            if self._is_first_run:
+                self.log("[--] 首次运行，已跳过「0-最近更新」目录生成", "info")
+            elif not self._stop_event.is_set():
+                self._copy_to_recent(new_files, new_album_names)
+            if not self._stop_event.is_set():
+                self._save_download_log()
+            self._log_completion(albums, new_album_names)
+        except Exception as e:
+            self.log(f"下载流程异常: {e}", "error")
+        finally:
+            self.root.after(0, self._log_renderer.stop_periodic)
+            time.sleep(0.15)
+            self.root.after(0, self._log_renderer.force_refresh)
+            self.downloading = False
+            time.sleep(0.2)
+            try:
+                self.session.close()
+            except Exception:
+                pass
+
+    def _log_completion(self, albums, new_album_names):
+        self.log("=" * 81, "info")
+        if new_album_names:
+            self.log("[OK] 全部下载完成！共处理 {} 个专辑".format(len(albums)), "success")
+            self._log_wrap("[++] 其中新增 {} 个专辑：".format(len(new_album_names)), new_album_names)
+        else:
+            self.log("[OK] 全部下载完成！共处理 {} 个专辑均已是最新".format(len(albums)), "success")
+        self.log("=" * 81, "info")
+        self._log_renderer.force_refresh()
+
+    def _update_progress(self):
+        if self.total_files > 0:
+            pct = (self.downloaded_files / self.total_files) * 100
+            self.progress_var.set(pct)
+            self.progress_label.config(text=f"{pct:.0f}%")
+
+    def _api_get(self, url, **kwargs):
+        with self._api_semaphore:
+            return self.session.get(url, **kwargs)
+
+    def _dl_get(self, url, **kwargs):
+        with self._dl_semaphore:
+            return self.session.get(url, **kwargs)
+
+    def _fetch_albums(self):
+        try:
+            resp = self._api_get(f"{self.API_BASE}/albums", timeout=self.API_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") == 0 and "data" in data:
+                self.log("[##] 成功获取 {} 个专辑信息".format(len(data['data'])), "success")
+                return data["data"]
+            self.log(f"专辑列表接口返回异常: code={data.get('code')}", "error")
+            return []
+        except ValueError as e:
+            self.log(f"API返回数据格式错误（可能被墙或服务异常）: {e}", "error")
+            return []
+        except Exception as e:
+            self.log(f"获取专辑列表失败: {e}", "error")
+            return []
+
+    def _fetch_album_detail(self, cid):
+        try:
+            resp = self._api_get(f"{self.API_BASE}/album/{cid}/detail", timeout=self.API_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("data") if data.get("code") == 0 else None
+        except Exception:
+            return None
+
+    def _fetch_song_detail(self, cid):
+        try:
+            resp = self._api_get(f"{self.API_BASE}/song/{cid}", timeout=self.API_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("data") if data.get("code") == 0 else None
+        except Exception:
+            return None
+
+    def _process_album(self, album, new_files, lock):
+        if self._stop_event.is_set():
+            return
+        cid = str(album["cid"])
+        name = album["name"]
+        folder = os.path.join(self.SAVE_DIR, self._sanitize(name))
+        os.makedirs(folder, exist_ok=True)
+        zone = self._AlbumZone(self, name)
+        zone.start("正在下载")
+        detail = self._fetch_album_detail(album["cid"])
+        if not detail or "songs" not in detail:
+            zone.error(f"无法获取专辑详情 (CID: {album['cid']})")
+            zone.complete("获取失败")
+            return
+        song_list = detail["songs"]
+        album_file_count = len(song_list) + (1 if detail.get("coverUrl") else 0)
+        with lock:
+            self.total_files += album_file_count
+        self._update_progress()
+        downloaded_songs = self.downloaded_log.get(cid, {}).get("songs", {})
+        pending_songs = [s for s in song_list if str(s["cid"]) not in downloaded_songs]
+        for s in song_list:
+            if str(s["cid"]) in downloaded_songs:
+                with lock:
+                    self.downloaded_files += 1
+                self._update_progress()
+        all_cover_exists = not detail.get("coverUrl") or any(
+            os.path.exists(os.path.join(folder, f"album-{self._sanitize(name)}{ext}"))
+            for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif")
+        )
+        if not pending_songs and all_cover_exists:
+            self._populate_skipped_zone(zone, detail, name, folder)
+            zone.complete("已跳过")
+            return
+        if detail.get("coverUrl"):
+            ext = os.path.splitext(detail["coverUrl"])[1] or ".png"
+            cover_path = os.path.join(folder, f"album-{self._sanitize(name)}{ext}")
+            if self._download_file(detail["coverUrl"], cover_path, lock, new_files, zone):
+                with lock:
+                    self.downloaded_files += 1
+                self._update_progress()
+        if pending_songs and not self._stop_event.is_set():
+            inner_exc = ThreadPoolExecutor(max_workers=self.MAX_SONG_WORKERS)
+            self._executors.append(inner_exc)
+            try:
+                futures = [inner_exc.submit(self._process_song, song, name, folder, cid, new_files, lock, zone)
+                           for song in pending_songs]
+                for future in as_completed(futures):
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        future.result(timeout=0.1)
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    inner_exc.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                if inner_exc in self._executors:
+                    self._executors.remove(inner_exc)
+        with lock:
+            if cid not in self.downloaded_log:
+                self.downloaded_log[cid] = {"albumName": name, "songs": {}}
+            else:
+                self.downloaded_log[cid]["albumName"] = name
+        zone.complete("下载完成")
+
+    def _populate_skipped_zone(self, zone, detail, album_name, folder):
+        if detail.get("coverUrl"):
+            ext = os.path.splitext(detail["coverUrl"])[1] or ".png"
+            zone.skip_file(f"album-{self._sanitize(album_name)}{ext}")
+        downloaded_songs = self.downloaded_log.get(str(detail.get("cid", "")), {}).get("songs", {})
+        for song in detail.get("songs", []):
+            if str(song["cid"]) not in downloaded_songs:
+                continue
+            safe_name = self._sanitize(song["name"])
+            audio_found = False
+            for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"):
+                if os.path.exists(os.path.join(folder, f"{safe_name}{ext}")):
+                    zone.skip_file(f"{safe_name}{ext}")
+                    audio_found = True
+                    break
+            if not audio_found:
+                zone.skip_file(f"{safe_name}.wav")
+            if os.path.exists(os.path.join(folder, f"{safe_name}.lrc")):
+                zone.skip_file(f"{safe_name}.lrc")
+            try:
+                for f in os.listdir(folder):
+                    if f.startswith(f"song-{safe_name}-"):
+                        zone.skip_file(f)
+                        break
+            except Exception:
+                pass
+
+    def _process_song(self, song, album_name, folder, album_cid, new_files, lock, zone):
+        if self._stop_event.is_set():
+            return
+        detail = self._fetch_song_detail(song["cid"])
+        if not detail:
+            zone.error(f"获取歌曲详情失败: {song['name']}")
+            with lock:
+                self.downloaded_files += 1
+            self._update_progress()
+            return
+        safe_name = self._sanitize(song["name"])
+        resources = []
+        src_url = detail.get("sourceUrl") or ""
+        if src_url:
+            ext = os.path.splitext(src_url)[1] or '.mp3'
+            resources.append((src_url, os.path.join(folder, f"{safe_name}{ext}")))
+        lyric_url = detail.get("lyricUrl") or ""
+        if lyric_url:
+            resources.append((lyric_url, os.path.join(folder, f"{safe_name}.lrc")))
+        mv_cover_url = detail.get("mvCoverUrl") or ""
+        if mv_cover_url:
+            mv_filename = f"song-{safe_name}-{os.path.basename(mv_cover_url)}"
+            resources.append((mv_cover_url, os.path.join(folder, mv_filename)))
+        has_new_downloads = False
+        for url, save_path in resources:
+            if self._download_file(url, save_path, lock, new_files, zone):
+                has_new_downloads = True
+        if has_new_downloads:
+            with lock:
+                entry = self.downloaded_log.setdefault(album_cid, {"albumName": "", "songs": {}})
+                entry["songs"][str(song["cid"])] = song["name"]
+        with lock:
+            self.downloaded_files += 1
+        self._update_progress()
+
+    @staticmethod
+    def _sanitize(filename):
+        illegal_chars = '\\/:*?"<>|'
+        for ch in illegal_chars:
+            filename = filename.replace(ch, '-')
+        return filename.strip().rstrip('.') or 'unknown'
+
+    def _download_file(self, url, save_path, lock, new_files, zone):
+        fname = os.path.basename(save_path)
+        idx = -1
+        try:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            if os.path.exists(save_path):
+                return False
+            idx = zone.downloading(f"{fname}")
+            response = self._dl_get(url, timeout=self.DOWNLOAD_TIMEOUT, stream=True)
+            response.raise_for_status()
+            with open(save_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        if self._stop_event.is_set():
+                            f.close()
+                            os.remove(save_path)
+                            zone.error((idx, "用户停止"))
+                            return False
+            size_mb = os.path.getsize(save_path) / (1024 * 1024)
+            zone.success(idx, fname, size_mb)
+            with lock:
+                new_files.append(save_path)
             return True
         except Exception as e:
-            self.log(f"下载失败: {os.path.basename(save_path)}", "error", f"错误信息: {str(e)}, URL: {url}")
-            # 下载失败时删除不完整的文件
+            zone.error((idx, f"下载失败: {fname} ({e})"))
             if os.path.exists(save_path):
                 try:
                     os.remove(save_path)
-                    self.log(f"删除不完整文件: {os.path.basename(save_path)}", "success")
-                except Exception as ex:
-                    self.log(f"删除不完整文件失败", "error", f"错误信息: {str(ex)}")
+                except Exception:
+                    pass
             return False
+
+    def _copy_to_recent(self, new_files, new_album_names=None):
+        if not new_files:
+            return
+        recent_dir = os.path.join(self.SAVE_DIR, "0-最近更新")
+        copied_count = 0
+        for file_path in new_files:
+            try:
+                album_name = os.path.basename(os.path.dirname(file_path))
+                dest_dir = os.path.join(recent_dir, album_name)
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.copy2(file_path, dest_dir)
+                copied_count += 1
+            except Exception as e:
+                self.log(f"复制文件失败: {os.path.basename(file_path)} - {e}", "error")
+        if new_album_names:
+            self._log_wrap("[=>] 已同步到「0-最近更新」目录，新增 {} 个专辑：".format(len(new_album_names)), new_album_names)
+        elif copied_count > 0:
+            self.log("[=>] 已同步 {} 个文件到「0-最近更新」目录".format(copied_count), "success")
+
 
 if __name__ == "__main__":
     root = Tk()
-    # 配置日志文本颜色
-    root.option_add("*Text.error.Foreground", "#e74c3c")
-    root.option_add("*Text.warning.Foreground", "#f39c12")
-    root.option_add("*Text.info.Foreground", "#3498db")
-    root.option_add("*Text.success.Foreground", "#27ae60")
-    
     app = SirenMusicDownloader(root)
     root.mainloop()
