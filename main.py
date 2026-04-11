@@ -58,7 +58,7 @@ class SirenMusicDownloader:
     FONT_BODY = 12
     FONT_SMALL = 11
     FONT_TINY = 9
-    FONT_BTN = 10
+    FONT_BTN = 11
     FONT_LOG = 9
 
     @staticmethod
@@ -174,7 +174,7 @@ class SirenMusicDownloader:
                      highlightbackground=self.COLORS['border'], highlightthickness=1)
         card.pack(fill="x", ipadx=28, ipady=16)
 
-        Label(card, text="[i] 【全量下载模式】- 请确保exe当前所在目录的存储空间足够！",
+        Label(card, text="[全量下载模式] - 请确保exe当前所在目录的剩余存储空间足够！",
               font=(self.FONT_FAMILY, self.FONT_SMALL), fg=self.COLORS['text_secondary'],
               bg=self.COLORS['bg_secondary']).pack(side="left", padx=18)
 
@@ -509,14 +509,9 @@ class SirenMusicDownloader:
             self.log(f"下载流程异常: {e}", "error")
         finally:
             self.root.after(0, self._log_renderer.stop_periodic)
-            time.sleep(0.15)
             self.root.after(0, self._log_renderer.force_refresh)
-            self.downloading = False
-            time.sleep(0.2)
-            try:
-                self.session.close()
-            except Exception:
-                pass
+            self.root.after(0, setattr, self, 'downloading', False)
+            self.root.after(0, self._safe_close_session)
 
     def _log_completion(self, albums, new_album_names):
         self.log("=" * 81, "info")
@@ -526,7 +521,7 @@ class SirenMusicDownloader:
         else:
             self.log("[OK] 全部下载完成！共处理 {} 个专辑均已是最新".format(len(albums)), "success")
         self.log("=" * 81, "info")
-        self._log_renderer.force_refresh()
+        self.root.after(0, self._log_renderer.force_refresh)
 
     def _update_progress(self):
         if self.total_files > 0:
@@ -746,6 +741,13 @@ class SirenMusicDownloader:
                 except Exception:
                     pass
             return False
+
+    def _safe_close_session(self):
+        try:
+            if self.session:
+                self.session.close()
+        except Exception:
+            pass
 
     def _copy_to_recent(self, new_files, new_album_names=None):
         if not new_files:
