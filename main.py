@@ -76,6 +76,11 @@ class SirenMusicDownloader:
         self._log_renderer = self._LogRenderer(self)
         self._load_download_log()
         self._is_first_run = not os.path.exists(self.LOG_FILE)
+        self.root.after(200, self._on_ui_ready)
+
+    def _on_ui_ready(self):
+        self._calc_line_width()
+        self._log_renderer.force_refresh()
 
     def _setup_window(self):
         self.root.title("塞壬唱片下载器 v2.0")
@@ -135,7 +140,6 @@ class SirenMusicDownloader:
         self._build_control_panel()
         self._build_log_panel()
         self._build_progress_bar()
-        self.root.after(200, self._calc_line_width)
 
     def _calc_line_width(self):
         try:
@@ -335,6 +339,7 @@ class SirenMusicDownloader:
             self.status = "正在下载"
             self.items = []
             self._started = False
+            self._has_new_songs = False
 
         def start(self, status="正在下载"):
             if self._started:
@@ -380,6 +385,9 @@ class SirenMusicDownloader:
             if not self._started:
                 return
             self.status = status
+
+        def mark_new_songs(self):
+            self._has_new_songs = True
 
         def _render_lines(self, txt, owner):
             is_done = self.status in ("下载完成", "已跳过", "获取失败")
@@ -497,7 +505,7 @@ class SirenMusicDownloader:
                     pass
                 if outer_exc in self._executors:
                     self._executors.remove(outer_exc)
-            new_album_names = [z.album_name for z in self._log_renderer.zones if z.status == "下载完成"]
+            new_album_names = [z.album_name for z in self._log_renderer.zones if z._has_new_songs]
             if self._is_first_run:
                 self.log("[--] 首次运行，已跳过「0-最近更新」目录生成", "info")
             elif not self._stop_event.is_set():
@@ -602,6 +610,10 @@ class SirenMusicDownloader:
             os.path.exists(os.path.join(folder, f"album-{self._sanitize(name)}{ext}"))
             for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif")
         )
+        if all_cover_exists and detail.get("coverUrl"):
+            with lock:
+                self.downloaded_files += 1
+            self._update_progress()
         if not pending_songs and all_cover_exists:
             self._populate_skipped_zone(zone, detail, name, folder)
             zone.complete("已跳过")
@@ -695,6 +707,7 @@ class SirenMusicDownloader:
             if self._download_file(url, save_path, lock, new_files, zone):
                 has_new_downloads = True
         if has_new_downloads:
+            zone.mark_new_songs()
             with lock:
                 entry = self.downloaded_log.setdefault(album_cid, {"albumName": "", "songs": {}})
                 entry["songs"][str(song["cid"])] = song["name"]
